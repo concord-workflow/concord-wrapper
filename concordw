@@ -1,0 +1,92 @@
+#!/bin/sh
+
+fail() {
+    printf 'concordw: %s\n' "$1" >&2
+    exit 1
+}
+
+script_dir=$(CDPATH= cd -P "$(dirname "$0")" 2>/dev/null && pwd) || fail "cannot locate wrapper directory"
+properties_file=$script_dir/.concord/wrapper/concord-wrapper.properties
+[ -f "$properties_file" ] && [ -r "$properties_file" ] || fail "cannot read properties file: $properties_file"
+
+distribution_url=
+distribution_sha256=
+seen_url=0
+seen_sha256=0
+while IFS= read -r line || [ -n "$line" ]; do
+    line=${line%"$(printf '\r')"}
+    trimmed=$(printf '%s' "$line" | awk '{sub(/^[ \t]*/, ""); sub(/[ \t]*$/, ""); print}')
+    case $trimmed in
+        ''|\#*|\!*) continue ;;
+        *=*) key=${trimmed%%=*}; value=${trimmed#*=} ;;
+        *) fail "malformed property in $properties_file: $trimmed" ;;
+    esac
+    key=$(printf '%s' "$key" | awk '{sub(/^[ \t]*/, ""); sub(/[ \t]*$/, ""); print}')
+    value=$(printf '%s' "$value" | awk '{sub(/^[ \t]*/, ""); sub(/[ \t]*$/, ""); print}')
+    case $key in
+        distributionUrl)
+            [ "$seen_url" -eq 0 ] || fail "duplicate key distributionUrl in $properties_file"
+            seen_url=1; distribution_url=$value ;;
+        distributionSha256Sum)
+            [ "$seen_sha256" -eq 0 ] || fail "duplicate key distributionSha256Sum in $properties_file"
+            seen_sha256=1; distribution_sha256=$value ;;
+        *) fail "unknown key $key in $properties_file" ;;
+    esac
+done < "$properties_file"
+[ "$seen_url" -eq 1 ] && [ -n "$distribution_url" ] || fail "missing or empty key distributionUrl in $properties_file"
+[ "$seen_sha256" -eq 1 ] && [ -n "$distribution_sha256" ] || fail "missing or empty key distributionSha256Sum in $properties_file"
+case $distribution_url in https://*) ;; *) fail "distributionUrl in $properties_file must use https://" ;; esac
+case $distribution_url in *[![:print:]]*|*[[:space:]]*) fail "distributionUrl in $properties_file contains whitespace" ;; esac
+case $distribution_sha256 in *[!0123456789abcdefABCDEF]*|'') fail "distributionSha256Sum in $properties_file must be 64 hexadecimal characters" ;; esac
+[ "${#distribution_sha256}" -eq 64 ] || fail "distributionSha256Sum in $properties_file must be 64 hexadecimal characters"
+distribution_sha256=$(printf '%s' "$distribution_sha256" | tr 'ABCDEF' 'abcdef')
+
+if [ -n "${JAVA_HOME:-}" ]; then
+    java=$JAVA_HOME/bin/java
+    [ -x "$java" ] || fail "JAVA_HOME does not contain an executable bin/java: $JAVA_HOME"
+else
+    java=$(command -v java 2>/dev/null) || fail "Java 17+ is required; install Java or set JAVA_HOME"
+    [ -n "$java" ] || fail "Java 17+ is required; install Java or set JAVA_HOME"
+fi
+if command -v sha256sum >/dev/null 2>&1; then
+    hash_file() { sha256sum < "$1" | awk '{print $1}'; }
+elif command -v shasum >/dev/null 2>&1; then
+    hash_file() { shasum -a 256 < "$1" | awk '{print $1}'; }
+else
+    fail "sha256sum or shasum is required"
+fi
+if [ -n "${XDG_CACHE_HOME:-}" ]; then cache_base=$XDG_CACHE_HOME/concord-wrapper
+elif [ -n "${HOME:-}" ]; then cache_base=$HOME/.cache/concord-wrapper
+else fail "set XDG_CACHE_HOME or HOME to an absolute cache directory"; fi
+case $cache_base in /*) ;; *) fail "cache directory must be absolute: $cache_base" ;; esac
+cache_dir=$cache_base/$distribution_sha256
+cache_file=$cache_dir/concord-cli.jar
+if [ -e "$cache_file" ] || [ -L "$cache_file" ]; then
+    [ -f "$cache_file" ] && [ ! -L "$cache_file" ] || fail "invalid cache entry $cache_file; remove it and rerun"
+    actual=$(hash_file "$cache_file") || fail "cannot verify cache entry $cache_file; remove it and rerun"
+    [ "$actual" = "$distribution_sha256" ] || fail "corrupt cache entry $cache_file; remove it and rerun"
+else
+    command -v curl >/dev/null 2>&1 || fail "curl is required to download Concord CLI"
+    mkdir -p "$cache_dir" 2>/dev/null || fail "cannot create cache directory: $cache_dir"
+    [ ! -L "$cache_dir" ] && [ -d "$cache_dir" ] || fail "invalid cache directory: $cache_dir"
+    temporary_dir=$(mktemp -d "$cache_dir/.concordw.XXXXXX") || fail "cannot create staging directory in $cache_dir"
+    cleanup() { [ -n "${temporary_dir:-}" ] && rm -rf "$temporary_dir"; }
+    trap cleanup 0
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    temporary_jar=$temporary_dir/concord-cli.jar
+    printf 'concordw: downloading Concord CLI\n' >&2
+    curl --fail --location --silent --show-error --proto '=https' --proto-redir '=https' --output "$temporary_jar" "$distribution_url" || fail "download failed: $distribution_url"
+    [ -s "$temporary_jar" ] || fail "downloaded artifact is empty"
+    actual=$(hash_file "$temporary_jar") || fail "cannot verify downloaded artifact"
+    [ "$actual" = "$distribution_sha256" ] || fail "download checksum mismatch"
+    if [ -e "$cache_file" ] || [ -L "$cache_file" ]; then
+        fail "cache destination appeared during download: $cache_file; remove it and rerun"
+    fi
+    mv "$temporary_jar" "$cache_file" 2>/dev/null || fail "cannot publish cache entry: $cache_file"
+    cleanup
+    temporary_dir=
+    trap - 0 HUP INT TERM
+fi
+exec "$java" -Xmx128m --enable-native-access=ALL-UNNAMED -jar "$cache_file" "$@"
